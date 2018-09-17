@@ -63,6 +63,7 @@ export default {
   },
   launchExpandedControls: GoogleCast.launchExpandedControls,
   showIntroductoryOverlay: GoogleCast.showIntroductoryOverlay,
+  requestMediaStatus: GoogleCast.requestMediaStatus,
 
   initChannel(namespace: string) {
     return GoogleCast.initChannel(namespace)

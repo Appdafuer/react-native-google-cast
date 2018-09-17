@@ -216,6 +216,12 @@ RCT_EXPORT_METHOD(seek : (int)playPosition) {
   }
 }
 
+RCT_EXPORT_METHOD(requestMediaStatus) {
+    if (castSession) {
+        [castSession.remoteMediaClient requestStatus];
+    }
+}
+
 #pragma mark - GCKSessionManagerListener events
 
 -(void)sessionManager:(GCKSessionManager *)sessionManager willStartCastSession:(GCKCastSession *)session {
