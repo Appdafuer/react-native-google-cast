@@ -209,6 +209,18 @@ public class GoogleCastModule
     }
 
     @ReactMethod
+    public void requestMediaStatus() {
+        if (mCastSession != null) {
+            getReactApplicationContext().runOnUiQueueThread(new Runnable() {
+                @Override
+                public void run() {
+                    mCastSession.getRemoteMediaClient().requestStatus();
+                }
+            });
+        }
+    }
+
+    @ReactMethod
     public void endSession(final boolean stopCasting, final Promise promise) {
         getReactApplicationContext().runOnUiQueueThread(new Runnable() {
             @Override
