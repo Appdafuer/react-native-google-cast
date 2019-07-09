@@ -12,6 +12,7 @@
   bool playbackStarted;
   bool playbackEnded;
   NSUInteger currentItemID;
+  NSTimer *progressTimer;
 }
 
 @synthesize bridge = _bridge;
@@ -38,6 +39,7 @@ RCT_EXPORT_MODULE();
     @"MEDIA_STATUS_UPDATED" : MEDIA_STATUS_UPDATED,
     @"MEDIA_PLAYBACK_STARTED" : MEDIA_PLAYBACK_STARTED,
     @"MEDIA_PLAYBACK_ENDED" : MEDIA_PLAYBACK_ENDED,
+    @"MEDIA_PROGRESS_UPDATED" : MEDIA_PROGRESS_UPDATED,
 
     @"CHANNEL_CONNECTED" : CHANNEL_CONNECTED,
     @"CHANNEL_MESSAGE_RECEIVED" : CHANNEL_MESSAGE_RECEIVED,
@@ -50,7 +52,7 @@ RCT_EXPORT_MODULE();
     SESSION_STARTING, SESSION_STARTED, SESSION_START_FAILED, SESSION_SUSPENDED,
     SESSION_RESUMING, SESSION_RESUMED, SESSION_ENDING, SESSION_ENDED,
 
-    MEDIA_STATUS_UPDATED, MEDIA_PLAYBACK_STARTED, MEDIA_PLAYBACK_ENDED,
+    MEDIA_STATUS_UPDATED, MEDIA_PLAYBACK_STARTED, MEDIA_PLAYBACK_ENDED, MEDIA_PROGRESS_UPDATED,
 
     CHANNEL_CONNECTED, CHANNEL_MESSAGE_RECEIVED, CHANNEL_DISCONNECTED
   ];
@@ -75,6 +77,21 @@ RCT_EXPORT_MODULE();
 
 # pragma mark - GCKCastContext methods
 
+RCT_REMAP_METHOD(getCastDevice,
+                 getCastDeviceWithResolver: (RCTPromiseResolveBlock) resolve
+                 rejecter: (RCTPromiseRejectBlock) reject) {
+  dispatch_async(dispatch_get_main_queue(), ^{
+    GCKDevice* device = [self->castSession device];
+    if (device == nil) { resolve(nil); }
+    else resolve(@{
+      @"id": device.deviceID,
+      @"version": device.deviceVersion,
+      @"name": device.friendlyName,
+      @"model": device.modelName,
+    });
+  });
+}
+
 RCT_REMAP_METHOD(getCastState,
                  getCastStateWithResolver: (RCTPromiseResolveBlock) resolve
                  rejecter: (RCTPromiseRejectBlock) reject) {
@@ -97,12 +114,15 @@ RCT_EXPORT_METHOD(showIntroductoryOverlay) {
 
 # pragma mark - GCKCastSession methods
 
-RCT_EXPORT_METHOD(initChannel: (NSString *)namespace) {
+RCT_EXPORT_METHOD(initChannel: (NSString *)namespace
+                  resolver:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject) {
   dispatch_async(dispatch_get_main_queue(), ^{
     GCKGenericChannel *channel = [[GCKGenericChannel alloc] initWithNamespace:namespace];
     channel.delegate = self;
-    channels[namespace] = channel;
-    [castSession addChannel:channel];
+    self->channels[namespace] = channel;
+    [self->castSession addChannel:channel];
+    resolve(@(YES));
   });
 }
 
@@ -123,10 +143,23 @@ RCT_EXPORT_METHOD(endSession: (BOOL)stopCasting
 
 #pragma mark - GCKCastChannel methods
 
-RCT_EXPORT_METHOD(sendMessage: (NSString *)message toNamespace: (NSString *)namespace) {
+RCT_EXPORT_METHOD(sendMessage: (NSString *)message
+                  toNamespace: (NSString *)namespace
+                  resolver: (RCTPromiseResolveBlock) resolve
+                  rejecter: (RCTPromiseRejectBlock) reject) {
   GCKCastChannel *channel = channels[namespace];
-  if (channel) {
-    [channel sendTextMessage:message error:nil];
+  
+  if (!channel) {
+    NSError *error = [NSError errorWithDomain:NSCocoaErrorDomain code:GCKErrorCodeChannelNotConnected userInfo:nil];
+    return reject(@"no_channel", [NSString stringWithFormat:@"Channel for namespace %@ does not exist. Did you forget to call initChannel?", namespace], error);
+  }
+  
+  NSError *error;
+  [channel sendTextMessage:message error:&error];
+  if (error != nil) {
+    reject(error.localizedFailureReason, error.localizedDescription, error);
+  } else {
+    resolve(@(YES));
   }
 }
 
@@ -141,6 +174,8 @@ RCT_EXPORT_METHOD(castMedia: (NSDictionary *)params
   NSString *studio = [RCTConvert NSString:params[@"studio"]];
   NSString *imageUrl = [RCTConvert NSString:params[@"imageUrl"]];
   NSString *posterUrl = [RCTConvert NSString:params[@"posterUrl"]];
+  NSString *contentType = [RCTConvert NSString:params[@"contentType"]];
+  NSDictionary *customData = [RCTConvert NSDictionary:params[@"customData"]];
   double streamDuration = [RCTConvert double:params[@"streamDuration"]];
   double playPosition = [RCTConvert double:params[@"playPosition"]];
 
@@ -158,6 +193,9 @@ RCT_EXPORT_METHOD(castMedia: (NSDictionary *)params
   if (studio) {
     [metadata setString:studio forKey:kGCKMetadataKeyStudio];
   }
+  if (!contentType) {
+    contentType = @"video/mp4";
+  }
 
   [metadata addImage:[[GCKImage alloc]
                          initWithURL:[[NSURL alloc] initWithString:imageUrl]
@@ -173,13 +211,12 @@ RCT_EXPORT_METHOD(castMedia: (NSDictionary *)params
   GCKMediaInformation *mediaInfo =
       [[GCKMediaInformation alloc] initWithContentID:mediaUrl
                                           streamType:GCKMediaStreamTypeBuffered
-                                         contentType:@"video/mp4"
+                                         contentType:contentType
                                             metadata:metadata
                                       streamDuration:streamDuration
                                          mediaTracks:nil
                                       textTrackStyle:nil
-                                          customData:nil];
-
+                                          customData:customData];
   // Cast the video.
   if (castSession) {
     [castSession.remoteMediaClient loadMedia:mediaInfo
@@ -224,7 +261,7 @@ RCT_EXPORT_METHOD(requestMediaStatus) {
 
 #pragma mark - GCKSessionManagerListener events
 
--(void)sessionManager:(GCKSessionManager *)sessionManager willStartCastSession:(GCKCastSession *)session {
+-(void)sessionManager:(GCKSessionManager *)sessionManager willStartSession:(GCKCastSession *)session {
   [self sendEventWithName:SESSION_STARTING body:@{}];
 }
 
@@ -279,16 +316,35 @@ RCT_EXPORT_METHOD(requestMediaStatus) {
     playbackStarted = false;
     playbackEnded = false;
   }
-    
+  
+  double position = mediaStatus.streamPosition;
+  double duration = mediaStatus.mediaInformation.streamDuration;
+  
   NSDictionary *status = @{
     @"playerState": @(mediaStatus.playerState),
     @"idleReason": @(mediaStatus.idleReason),
     @"muted": @(mediaStatus.isMuted),
-    @"streamPosition": @(mediaStatus.streamPosition),
+    @"streamPosition": isinf(position) || isnan(position) ? [NSNull null] : @(position),
+    @"streamDuration": isinf(duration) || isnan(duration) ? [NSNull null] : @(duration),
   };
 
   [self sendEventWithName:MEDIA_STATUS_UPDATED body:@{@"mediaStatus":status}];
 
+  if (mediaStatus.playerState == GCKMediaPlayerStatePlaying) {
+    if (!progressTimer) {
+      progressTimer = [NSTimer
+        scheduledTimerWithTimeInterval:1.0
+                                target:self
+                              selector:@selector(progressUpdated:)
+                              userInfo:@(mediaStatus.mediaInformation.streamDuration)
+                               repeats:YES
+      ];
+    }
+  } else {
+    [progressTimer invalidate];
+    progressTimer = nil;
+  }
+  
   if (!playbackStarted && mediaStatus.playerState == GCKMediaPlayerStatePlaying) {
     [self sendEventWithName:MEDIA_PLAYBACK_STARTED body:@{@"mediaStatus":status}];
     playbackStarted = true;
@@ -298,6 +354,16 @@ RCT_EXPORT_METHOD(requestMediaStatus) {
     [self sendEventWithName:MEDIA_PLAYBACK_ENDED body:@{@"mediaStatus":status}];
     playbackEnded = true;
   }
+}
+
+-(void) progressUpdated:(NSTimer*)theTimer {
+  double progress = [castSession.remoteMediaClient approximateStreamPosition];
+  if (!progress || progress == INFINITY || progress == NAN) { return; }
+  NSDictionary *mediaProgress = @{
+    @"progress": @(progress),
+    @"duration": [theTimer userInfo],
+  };
+  [self sendEventWithName:MEDIA_PROGRESS_UPDATED body:@{@"mediaProgress":mediaProgress}];
 }
 
 #pragma mark - GCKGenericChannelDelegate events
